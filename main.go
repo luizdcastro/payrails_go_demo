@@ -1,14 +1,26 @@
 package main
 
 import (
+	"log"
+	"os"
+
 	"github.com/gin-gonic/gin"
-	"payrails-server-demo/routes"
+	"github.com/joho/godotenv"
+	"payrails-server-demo/controllers"
 )
 
 func main() {
+	_ = godotenv.Load()
+
 	r := gin.Default()
 
-	routes.PayrailsRoutes(r)
+	r.POST("/payrails/sdk", controllers.InitSDK)
 
-	r.Run(":5000")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5000"
+	}
+
+	log.Printf("Server running on port %s", port)
+	r.Run(":" + port)
 }
