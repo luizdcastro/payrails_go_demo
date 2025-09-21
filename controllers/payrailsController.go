@@ -20,6 +20,8 @@ type Config struct {
 	ClientID string
 	APIKey   string
 	BaseURL  string
+	CertB64  string
+	KeyB64   string
 }
 
 func LoadConfig() *Config {
@@ -27,6 +29,8 @@ func LoadConfig() *Config {
 		ClientID: os.Getenv("PAYRAILS_CLIENT_ID"),
 		APIKey:   os.Getenv("PAYRAILS_API_KEY"),
 		BaseURL:  os.Getenv("PAYRAILS_BASE_URL"),
+		CertB64:  os.Getenv("MTLS_CLIENT_CERT"),
+		KeyB64:   os.Getenv("MTLS_CLIENT_KEY"),
 	}
 }
 
@@ -35,7 +39,8 @@ var (
 	tokenExpiry time.Time
 	tokenMutex  sync.Mutex
 )
-func getBearerToken(cfg *Config) (string, error) {
+
+func getBearerToken(cfg *Config, client *http.Client) (string, error) {
 	if cfg.ClientID == "" || cfg.APIKey == "" || cfg.BaseURL == "" {
 		return "", fmt.Errorf("clientId, apiKey, or baseUrl missing")
 	}
@@ -48,11 +53,15 @@ func getBearerToken(cfg *Config) (string, error) {
 	}
 
 	url := fmt.Sprintf("%s/auth/token/%s", cfg.BaseURL, cfg.ClientID)
-	req, _ := http.NewRequest("POST", url, nil)
-	req.Header.Set("accept", "application/json")
+
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-key", cfg.APIKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -64,9 +73,12 @@ func getBearerToken(cfg *Config) (string, error) {
 	}
 
 	var data map[string]interface{}
-	_ = json.Unmarshal(body, &data)
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", fmt.Errorf("invalid JSON in token response: %v", err)
+	}
+
 	token, ok := data["access_token"].(string)
-	if !ok {
+	if !ok || token == "" {
 		return "", fmt.Errorf("access_token missing in response")
 	}
 
@@ -75,18 +87,16 @@ func getBearerToken(cfg *Config) (string, error) {
 	return cachedToken, nil
 }
 
-func createMTLSClient() (*http.Client, error) {
-	certB64 := os.Getenv("MTLS_CLIENT_CERT")
-	keyB64 := os.Getenv("MTLS_CLIENT_KEY")
-
+func createMTLSClientFromBase64(certB64, keyB64 string) (*http.Client, error) {
 	if certB64 == "" || keyB64 == "" {
 		return http.DefaultClient, nil
 	}
 
 	certPEM, err := base64.StdEncoding.DecodeString(certB64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode cert: %v", err)
+		return nil, fmt.Errorf("failed to decode certificate: %v", err)
 	}
+
 	keyPEM, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode key: %v", err)
@@ -103,14 +113,22 @@ func createMTLSClient() (*http.Client, error) {
 	}
 
 	return &http.Client{
-		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
 	}, nil
 }
 
 func InitSDK(c *gin.Context) {
 	cfg := LoadConfig()
 
-	token, err := getBearerToken(cfg)
+	client, err := createMTLSClientFromBase64(cfg.CertB64, cfg.KeyB64)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	token, err := getBearerToken(cfg, client)
 	if err != nil {
 		c.JSON(401, gin.H{"error": err.Error()})
 		return
@@ -120,51 +138,86 @@ func InitSDK(c *gin.Context) {
 	url := fmt.Sprintf("%s/merchant/client/init", cfg.BaseURL)
 
 	var payload map[string]interface{}
-	if err := c.ShouldBindJSON(&payload); err != nil || len(payload) == 0 {
-		// Default payload if none provided
-		payload = map[string]interface{}{
-			"type":             "dropIn",
-			"workflowCode":     "payment-acceptance",
-			"merchantReference": uuid.NewString(),
-			"holderReference":   uuid.NewString(),
-			"amount": map[string]string{
-				"value":    "999",
-				"currency": "EUR",
+if err := c.ShouldBindJSON(&payload); err != nil || len(payload) == 0 {
+	payload = map[string]interface{}{
+		"type":             "dropIn",
+		"workflowCode":     "payment-acceptance",
+		"merchantReference": uuid.NewString(),
+		"holderReference":   uuid.NewString(),
+		"amount": map[string]string{
+			"value":    "100",
+			"currency": "EUR",
+		},
+		"meta": map[string]interface{}{
+			"source": "portal",
+			"customer": map[string]string{
+				"name":      "John",
+				"lastName":  "Doe",
+				"email":     "john.doe@payrails.com",
+				"reference": uuid.NewString(),
 			},
-			"meta": map[string]interface{}{
-				"customer": map[string]interface{}{
-					"email": "test@example.com",
-					"country": map[string]string{
-						"code": "DE",
-					},
+			"billingAddress": map[string]interface{}{
+				"city":       "Berlin",
+				"country":    map[string]string{"code": "DE"},
+				"postalCode": "10405",
+				"street":     "Straßburger Straße",
+				"doorNumber": "1",
+			},
+			"order": map[string]interface{}{
+				"deliveryAddress": map[string]interface{}{
+					"city":       "Berlin",
+					"country":    map[string]string{"code": "DE"},
+					"postalCode": "10405",
+					"street":     "Straßburger Straße",
+					"doorNumber": "1",
 				},
-				"CIT": true,
-				"order": map[string]interface{}{
-					"lines": []map[string]interface{}{
-						{
-							"id":       "line_demo_1",
-							"name":     "Basic Package",
-							"quantity": 1,
-							"unitPrice": map[string]string{
-								"currency": "EUR",
-								"value":    "999",
-							},
+				"billingAddress": map[string]interface{}{
+					"city":       "Berlin",
+					"country":    map[string]string{"code": "DE"},
+					"postalCode": "10405",
+					"street":     "Straßburger Straße",
+					"doorNumber": "1",
+					"name":       "John",
+					"lastName":   "Doe",
+					"email":      "john.doe@payrails.com",
+				},
+				"lines": []map[string]interface{}{
+					{
+						"id": "2c3263d9-4223-4fcb-8c4e-2559884c33b6",
+						"quantity": 1,
+						"name": "fce35d2a-6a38-49d7-ab9d-a1c91f8e0c25",
+						"unitPrice": map[string]string{
+							"value":    "100",
+							"currency": "EUR",
 						},
 					},
 				},
 			},
-		}
+			"clientContext": map[string]interface{}{
+				"ipAddress":        "217.110.239.132",
+				"osType":           "web",
+				"userAgent":        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+				"acceptHeader":     "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"language":         "en-US",
+				"colorDepth":       24,
+				"screenHeight":     723,
+				"screenWidth":      1536,
+				"timeZoneOffset":   0,
+				"javaEnabled":      false,
+				"javaScriptEnabled": false,
+			},
+			"subscription": map[string]string{
+				"chargeFrequency": "P2D",
+				"expiration":      "2040-09-01",
+			},
+		},
 	}
+}
+
 
 	jsonPayload, _ := json.Marshal(payload)
-	client, err := createMTLSClient()
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
-	req.Header.Set("accept", "application/json")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-idempotency-key", idempotencyKey)
 	req.Header.Set("Authorization", "Bearer "+token)
