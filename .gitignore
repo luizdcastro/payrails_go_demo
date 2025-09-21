@@ -1,0 +1,23 @@
+# Go build output
+/bin/
+/*.exe
+/*.test
+
+# Go modules
+/vendor/
+
+# IDE/editor settings
+.idea/
+.vscode/
+*.swp
+
+# Environment files (credentials, keys)
+.env
+*.pem
+*.key
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
